@@ -1,0 +1,1302 @@
+---
+title: "Predicting Life Expectancy in U.S. Cities: How A Machine Learning Solution May Aid In Budgetary Decision-Making"
+subtitle: "Compiled Code"
+author: Nikolas Tubert
+date: '2025-12-04'
+output:
+  html_document:
+    theme: flatly
+    toc: yes
+    toc_float:
+      collapsed: true
+---
+
+# LOAD LIBRARIES
+```{r, warning = FALSE, message = FALSE}
+library(readr)
+library(dplyr)
+library(tidyr)
+library(mice)
+library(ggformula)
+library(ggplot2)
+library(scales)
+library(knitr)
+library(gridExtra)
+library(broom)
+library(naniar)
+library(caret)
+library(MASS)
+library(ggforce)
+library(corrplot)
+library(car)
+library(packcircles)
+library(kableExtra)
+library(grid)
+library(xgboost)
+library(glmnet)
+library(nnet)
+library(SHAPforxgboost)
+library(pdp)
+```
+
+# DATA COLLECTION, CLEANING AND PREPROCESSING
+In this section of code, I load in the data from a .csv file, explore the overall data structure, perform some initial data cleaning steps, impute missing values, and assess the presence of outliers.
+
+## Read-in Data
+```{r, include=FALSE}
+bchc <- read_csv("BigCitiesHealth.csv")
+```
+
+## Data Structure
+```{r}
+dim(bchc)
+summary(bchc)
+```
+
+## Heatmap of real vs. proxy values
+```{r}
+# Count rows by the two proxy variables
+proxy_counts <- bchc %>% count(geo_label_proxy_or_real, date_label_proxy_or_real)
+
+# Heatmap theme
+heatmap_theme <- theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", size = 16, hjust = 0.5),
+    plot.subtitle = element_text(face = "italic", size = 13, hjust = 0.5),
+    axis.text.x = element_text(hjust = 1),
+    panel.grid = element_blank()
+  )
+
+# Heatmap
+ggplot(proxy_counts, aes(x = geo_label_proxy_or_real, y = date_label_proxy_or_real, fill = n)) +
+  geom_tile(color = "grey80") +
+  geom_text(aes(label = comma(n)), color = "#c77904", size = 4, fontface="bold") +
+  scale_fill_gradientn(
+    colors = c("#f7fbff", "#6baed6", "#08306b"),
+    values = rescale(c(0, max(proxy_counts$n) / 3, max(proxy_counts$n))),
+    na.value = "white",
+    labels = comma
+  ) +
+  labs(
+    title = "Heatmap of Row Counts",
+    subtitle = "By Proxy Indicators",
+    x = "Geographic Proxy Indicator",
+    y = "Date Proxy Indicator",
+    fill = "Row Count"
+  ) +
+  heatmap_theme
+```
+
+## Initial Data Cleaning
+```{r}
+# Select, rename, and clean columns
+bchc <- bchc %>%
+  dplyr::select(
+    metric_item_label,
+    geo_label_citystate,
+    date_label,
+    value,
+    strata_race_label,
+    strata_sex_label
+  ) %>%
+  rename(
+    metric = metric_item_label,
+    city = geo_label_citystate,
+    year = date_label,
+    race = strata_race_label,
+    sex = strata_sex_label
+  ) %>%
+  mutate(
+    metric = tolower(gsub("[,().-/]", "", gsub(" ", "_", metric))),
+    city = factor(city),
+    year = factor(year),
+    race = factor(race),
+    sex = factor(sex)
+  ) %>%
+  filter(city != "U.S. Total")
+
+# Reshape data frame
+bchc_wide <- bchc %>%
+  pivot_wider(
+    names_from = metric,
+    values_from = value
+  )
+
+# Correct any invalid column names
+colnames(bchc_wide) <- make.names(colnames(bchc_wide), unique = TRUE)
+
+# Sort values
+bchc_wide <- arrange(bchc_wide, city, race, sex, year)
+```
+
+## Inspect Missingness, Drop Data, and Impute
+### Inital Assessment of Missingness
+```{r}
+na_cells <- sum(is.na(bchc_wide))
+total_cells <- sum(!is.na(bchc_wide)) + sum(is.na(bchc_wide))
+print(paste0("Original Missing Percent: ", na_cells / total_cells))
+```
+
+### Drop Data
+#### Step 1: Drop rows with high % of info missing (retaining rows for Long Beach, CA in year 2023)
+```{r}
+row_missing_pct <- rowMeans(is.na(bchc_wide))
+missing_pct_p75 <- quantile(row_missing_pct, 0.75)
+bchc_wide <- bchc_wide[row_missing_pct <= missing_pct_p75 | (bchc_wide$city == "Long Beach, CA" & bchc_wide$year == "2023"), ]
+```
+
+#### Step 2: Drop metrics with high % info missing
+```{r}
+# Summary of column missingness
+total_rows <- nrow(bchc_wide)
+na_by_metric <- data.frame(
+  metric = names(bchc_wide),
+  populated_rows = sapply(bchc_wide, function(x) sum(!is.na(x))),
+  na_rows = sapply(bchc_wide, function(x) sum(is.na(x))),
+  na_pct = sapply(bchc_wide, function(x) sum(is.na(x)) / total_rows),
+  row.names = NULL
+) %>%
+  filter(
+    metric != "city",
+    metric != "year",
+    metric != "race",
+    metric != "sex",
+  ) %>%
+  arrange(populated_rows)
+
+# Histogram theme
+hist_theme <- theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", size = 16, hjust = 0.5),
+    plot.subtitle = element_text(face = "italic", size = 13, hjust = 0.5)
+  )
+
+# Histogram
+ggplot(na_by_metric, aes(x = na_pct)) +
+  geom_histogram(fill="#005AB5", color="#c9c9c9", binwidth=0.03) +
+  geom_vline(xintercept=0.75, linetype = "dashed", color="#b30404", size=1) +
+  labs(title = "Histogram of Variable Missingness",
+       subtitle = "Count of Variables by Missing Percent",
+       x = "Missing Percent",
+       y = "Count of Variables") +
+  hist_theme
+```
+
+```{r}
+# Drop columns with high missing %
+metrics_to_drop <- na_by_metric %>%
+  filter(na_pct > 0.75) %>%
+  pull(metric)
+
+bchc_wide <- bchc_wide %>%
+  dplyr::select(-all_of(metrics_to_drop))
+```
+
+### Final Assessment of Missingness
+```{r}
+na_cells <- sum(is.na(bchc_wide))
+total_cells <- sum(!is.na(bchc_wide)) + sum(is.na(bchc_wide))
+print(paste0("Missing Percent: ", na_cells / total_cells))
+```
+
+### Impute
+#### Step 1: Test for MAR
+```{r, warning=FALSE}
+# Create Boolean columns for each variable (TRUE if NA, FALSE if populated)
+vars_to_check <- names(bchc_wide %>% dplyr::select(-c(city, year, race, sex)))
+
+missing_inds <- bchc_wide %>%
+  mutate(across(all_of(vars_to_check), ~is.na(.), .names = "missing_{.col}"))
+
+# For each Boolean column, run logistic regression with city, year, race, and sex as independent variables
+results <- list()
+
+for (var in vars_to_check) {
+  formula_str <- paste0("missing_", var, " ~ city + year + race + sex")
+  formula_obj <- as.formula(formula_str)
+  
+  model <- glm(formula_obj, data = missing_inds, family = binomial)
+  results[[var]] <- model
+}
+
+# Summarize p-values
+pval_summary <- lapply(names(results), function(var) {
+  model <- results[[var]]
+  if (!is.null(model)) {
+    tidy_model <- broom::tidy(model)
+    tidy_model$variable <- var
+    return(tidy_model)
+  }
+})
+
+pval_df <- do.call(rbind, pval_summary)
+
+# Distinguish between variables that have significant terms (p-value < 0.05) and variables with no significant terms
+mar_flags <- pval_df %>%
+  filter(term != "(Intercept)", p.value < 0.05) %>%
+  distinct(variable) %>%
+  mutate(missingness_type = "MAR")
+
+all_vars <- data.frame(variable = vars_to_check)
+missingness_types <- all_vars %>%
+  left_join(mar_flags, by = "variable") %>%
+  mutate(missingness_type = ifelse(is.na(missingness_type), "MCAR or MNAR", missingness_type))
+
+print(paste(nrow(mar_flags), " variables of the total ",  nrow(missingness_types), "have significant terms in the logistic regression models"))
+```
+
+#### Step 2: Imputation using Predictive Mean Matching
+```{r, warning=FALSE}
+# Initiate MICE method
+mice_method <- make.method(bchc_wide)
+mice_method[] <- ""
+mice_method[vars_to_check] <- "pmm"
+
+# Construct predictor matrix
+mice_pred <- make.predictorMatrix(bchc_wide)
+mice_pred[,] <- 0
+mice_pred[vars_to_check, c("city", "year", "race", "sex")] <- 1
+mice_pred[vars_to_check, vars_to_check] <- 1
+
+# Impute
+mice <- mice(bchc_wide,
+  m = 1,
+  method = mice_method,
+  predictorMatrix = mice_pred,
+  seed = 10,
+  printFlag = FALSE)
+
+bchc_imputed <- complete(mice)
+```
+
+## Outlier Detection
+### Step 1: Find all variables that have outliers
+```{r}
+outlier_detect <- function(x) {
+  q1 <- quantile(x, 0.25)
+  q3 <- quantile(x, 0.75)
+  iqr <- q3 - q1
+  lower <- q1 - 1.5 * iqr
+  upper <- q3 + 1.5 * iqr
+  any(x < lower | x > upper)
+}
+
+vars_with_outliers <- Filter(function(var) outlier_detect(bchc_imputed[[var]]), vars_to_check)
+```
+
+### Step 2: Example of transformation/scaling to be used
+```{r}
+var <- "premature_death"
+
+# Calculate scaled values
+bchc_scaled <- dplyr::select(bchc_imputed, all_of(var))
+pre_yeo <- preProcess(bchc_scaled[, var, drop = FALSE], method = c("YeoJohnson", "center", "scale"))
+bchc_scaled[[paste0(var, "_yeo")]] <- predict(pre_yeo, bchc_scaled[, var, drop = FALSE])[, 1]
+
+pre_range <- preProcess(bchc_scaled[, var, drop = FALSE], method = c("YeoJohnson", "range"))
+bchc_scaled[[paste0(var, "_range")]] <- predict(pre_range, bchc_scaled[, var, drop = FALSE])[, 1]
+
+# Count outliers
+count_outliers <- function(x) {
+  stats <- boxplot.stats(x)
+  length(stats$out)
+}
+
+n_outliers <- count_outliers(bchc_scaled[[var]])
+n_outliers_yeo <- count_outliers(bchc_scaled[[paste0(var, "_yeo")]])
+n_outliers_range <- count_outliers(bchc_scaled[[paste0(var, "_range")]])
+
+# Boxplot theme
+boxplot_theme <- theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", size = 18, color = "#2c3e50", hjust = 0.5),
+    plot.subtitle = element_text(face = "italic", size = 14, color = "#34495e", hjust = 0.5),
+    axis.title.y = element_text(size = 14, face = "bold", color = "#2c3e50"),
+    axis.text.y = element_text(size = 12, color = "#2c3e50"),
+    axis.title.x = element_blank(),
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    axis.line.x = element_blank()
+  )
+
+# Raw boxplot
+ggplot(bchc_scaled, aes(y = .data[[var]])) +
+  geom_boxplot(
+    fill = "#3498db",                
+    outlier.colour = "#b30404",      
+    outlier.shape = 8,
+    outlier.size = 2
+  ) +
+  annotate("text", x = 0.3, y = max(bchc_scaled[[var]]), 
+           label = paste("Outliers:", n_outliers),
+           hjust = 1.1, vjust = -0.5, color = "#b30404", size = 4) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(title = paste("Boxplot of", var),
+       subtitle = "No Transformation or Scaling",
+       y = paste(var)) +
+  boxplot_theme
+
+# Yeo-Johnson + Center/Scale boxplot
+ggplot(bchc_scaled, aes(y = .data[[paste0(var, "_yeo")]])) +
+  geom_boxplot(
+    fill = "#2ecc71",                
+    outlier.colour = "#b30404",
+    outlier.shape = 8,
+    outlier.size = 2
+  ) +
+  annotate("text", x = 0.3, y = max(bchc_scaled[[paste0(var, "_yeo")]]), 
+           label = paste("Outliers:", n_outliers_yeo),
+           hjust = 1.1, vjust = -0.5, color = "#b30404", size = 4) +
+  labs(
+    title = paste("Boxplot of", var),
+    subtitle = "Yeo-Johnson + Traditional Scaling",
+    y = paste(var, "\nYeo-Johnson + Scaling")
+  ) +
+  boxplot_theme
+
+# Yeo-Johnson + Min-Max boxplot
+ggplot(bchc_scaled, aes(y = .data[[paste0(var, "_range")]])) +
+  geom_boxplot(
+    fill = "#f1c40f",                
+    outlier.colour = "#b30404",
+    outlier.shape = 8,
+    outlier.size = 2
+  ) +
+  annotate("text", x = 0.3, y = max(bchc_scaled[[paste0(var, "_range")]]), 
+           label = paste("Outliers:", n_outliers_range),
+           hjust = 1.1, vjust = -0.5, color = "#b30404", size = 4) +
+  labs(
+    title = paste("Boxplot of", var),
+    subtitle = "Yeo-Johnson + Min-Max Scaling",
+    y = paste(var, "\nYeo-Johnson + Min-Max Scaling")
+  ) +
+  boxplot_theme
+```
+
+# EXPLORATORY DATA ANALYSIS
+In this section of code, I explore the remaining potential predictor variables, dropping redundant features based on correlation analysis and engineering one new feature. Additionally, I explore descriptive statistics related to the dependent variable and the independent variables, while also examing some relationships between predictors and the response variable.
+
+## Assess Available Data
+### List of columns
+```{r}
+colnames(bchc_imputed)
+```
+
+### Categorize Columns and Visualize with Bubble Map
+```{r}
+# Define categories
+demographic <- c("city", "year", "race", "sex")
+disease_mortality <- c("all_cancer_deaths", "lung_cancer_deaths", "colorectal_cancer_deaths", "breast_cancer_deaths", "prostate_cancer_deaths",
+                       "cardiovascular_disease_deaths", "heart_disease_deaths", "diabetes_deaths", "pneumonia_or_influenza_deaths", "hiv.related_deaths")
+other_mortality <- c("deaths_from_all_causes", "premature_death", "gun_deaths_firearms", "injury_deaths", "motor_vehicle_deaths", "police_killings",
+                     "homicides", "infant_deaths", "drug_overdose_deaths", "opioid_overdose_deaths", "suicide")
+healthcare <- c("uninsured_all_ages", "uninsured_child", "prenatal_care", "flu_vaccinations_medicare", "people_with_disabilities", 
+                "hivaids_prevalence", "teen_births", "low_birthweight")
+transportation <- c("walking_to_work", "public_transportation_use", "drives_alone_to_work")
+socioeconomic <- c("single.parent_families", "owner_occupied_housing", "renters_vs_owners", "college_graduates", "poverty_in_all_ages",
+                   "poverty_in_children", "per.capita_household_income", "unemployment", "service_workers")
+
+var_groups <- list(
+  Demographic = demographic,
+  `Disease Mortality` = disease_mortality,
+  `Other Mortality` = other_mortality,
+  Healthcare = healthcare,
+  Transportation = transportation,
+  Socioeconomic = socioeconomic
+)
+
+# Create data frame of category variable
+bubble_data <- bind_rows(
+  lapply(names(var_groups), function(group) {
+    data.frame(
+      group = group,
+      var_count = length(var_groups[[group]])
+    )
+  })
+)
+bubble_data$area <- bubble_data$var_count
+
+# Build bubble map
+packing <- circleProgressiveLayout(bubble_data$area, sizetype = "area")
+bubble_data <- bind_cols(bubble_data, packing)
+
+circle_polygons <- circleLayoutVertices(packing, npoints = 50)
+
+ggplot() +
+  geom_polygon(data = circle_polygons,
+               aes(x, y, group = id, fill = as.factor(id)),
+               color = "black", alpha = 0.4) +
+  geom_text(data = bubble_data,
+            aes(x, y + radius * 0.2, label = group),
+            size = 3.5, fontface = "bold") +
+  geom_text(data = bubble_data,
+            aes(x, y - radius * 0.2, label = paste0(var_count, " variables")),
+            size = 3) +
+  coord_equal() +
+  theme_void() +
+  theme(legend.position = "none",
+        plot.title = element_text(face = "bold", size = 16, hjust = 0.5),
+        plot.subtitle = element_text(face = "italic", size = 13, hjust = 0.5)) +
+  labs(title = "Predictor Variable Categories",
+       subtitle = "Count of Predictors Per Category")
+
+```
+
+## Multicollinearity
+### Build Correlation Matrix
+```{r}
+# Get correlation matrix of numeric predictors
+num_predictors <- bchc_imputed[, setdiff(names(bchc_imputed), c("city", "year", "race", "sex", "life_expectancy"))]
+corr_matrix <- cor(num_predictors, use = "pairwise.complete.obs")
+
+# Find pairs of predictors that are highly correlated
+high_corr_pairs <- which(abs(corr_matrix) > 0.8 & lower.tri(corr_matrix), arr.ind = TRUE)
+
+high_corr_var_names <- data.frame(
+  var1 = rownames(corr_matrix)[high_corr_pairs[, 1]],
+  var2 = colnames(corr_matrix)[high_corr_pairs[, 2]],
+  correlation = corr_matrix[high_corr_pairs]
+) %>%
+  arrange(var1)
+
+high_corr_vars <- unique(c(
+  rownames(corr_matrix)[high_corr_pairs[, 1]],
+  colnames(corr_matrix)[high_corr_pairs[, 2]]
+))
+
+high_corr_matrix <- corr_matrix[high_corr_vars, high_corr_vars]
+
+high_corr_var_names
+```
+
+### Produce correlation heatmap
+```{r}
+corrplot(high_corr_matrix,
+         method = "circle",
+         type = "upper",
+         order = "hclust",
+         tl.col = "black",
+         tl.cex = 0.7,
+         col = colorRampPalette(c("#005AB5", "white", "#b30404"))(200),
+         title = "Predictor Correlation Heatmap (r > 0.8)",
+         mar = c(0, 0, 2, 0))
+```
+
+### Addressing Redundant/Unneeded Variables
+#### Table illustrating redundancy
+```{r}
+redundant <- high_corr_var_names %>%
+  filter((var1 == "heart_disease_deaths" & var2 == "cardiovascular_disease_deaths") |
+           (var1 == "opioid_overdose_deaths" & var2 == "drug_overdose_deaths") |
+           (var1 == "poverty_in_children" & var2 == "poverty_in_all_ages") |
+           (var1 == "renters_vs_owners" & var2 == "owner_occupied_housing") |
+           (var1 == "homicides" & var2 == "gun_deaths_firearms")) %>%
+  mutate(correlation = round(correlation, 2))
+
+redundant %>%
+  kbl(caption = "Redundant Variable Correlations") %>%
+  kable_classic(full_width = FALSE, html_font = "Cambria")
+```
+
+#### High VIF Table
+```{r}
+lm <- lm(life_expectancy ~ ., data = bchc_imputed)
+vif <- vif(lm)
+high_vif <- data.frame(
+  feature = rownames(vif),
+  adjusted_gvif = round(vif[, "GVIF^(1/(2*Df))"], 2)
+) %>%
+  filter(adjusted_gvif > 10) %>%
+  arrange(desc(adjusted_gvif))
+
+high_vif %>%
+  kbl(caption = "Features with Adjusted GVIF > 10", row.names = FALSE) %>%
+  kable_classic(full_width = FALSE, html_font = "Cambria")
+```
+
+#### Drop Redundant Variables
+```{r}
+vars_to_drop <- c("deaths_from_all_causes", "premature_death", "heart_disease_deaths",
+                  "opioid_overdose_deaths", "poverty_in_children", "owner_occupied_housing")
+bchc_final <- bchc_imputed %>% dplyr::select(-all_of(vars_to_drop))
+```
+
+#### Feature Engineering - Homicide/Gun Index
+```{r}
+bchc_final <- bchc_final %>%
+  mutate(homicides_scaled = scale(homicides),
+         gun_deaths_scaled = scale(gun_deaths_firearms),
+         homicide_gun_index = rowMeans(cbind(homicides_scaled, gun_deaths_scaled)))
+
+bchc_final <- bchc_final %>% dplyr::select(-all_of(c("homicides", "homicides_scaled", "gun_deaths_firearms", "gun_deaths_scaled")))
+```
+
+## Descriptive Statistics
+### Predictor Distribution Examples
+```{r}
+hist_drug <- ggplot(bchc_final, aes(x = drug_overdose_deaths)) +
+  geom_histogram(fill = "#b35707", color = "#c9c9c9", binwidth = 5) +
+  labs(title = "Histogram of Drug Overdose Deaths",
+       x = "Drug Overdose Deaths\n(Per 100,000, Age-Adjusted)",
+       y = "Count of Rows") +
+  hist_theme
+
+hist_cancer <- ggplot(bchc_final, aes(x = all_cancer_deaths)) +
+  geom_histogram(fill = "#470a70", color = "#c9c9c9", binwidth = 5) +
+  labs(title = "Histogram of Cancer Deaths",
+       x = "All Cancer Deaths\n(Per 100,000, Age-Adjusted)",
+       y = "Count of Rows") +
+  hist_theme
+
+grid.arrange(hist_drug, hist_cancer, nrow=2)
+```
+
+### Life Expectancy Summary Statistics Table
+```{r}
+le_descriptives <- as.data.frame(unclass(summary(bchc_final$life_expectancy)))
+colnames(le_descriptives) <- "Statistic Value"
+
+le_descriptives %>%
+  kbl(caption = "Descriptive Statistics: Life Expectancy") %>%
+  kable_classic(full_width = FALSE, html_font = "Cambria")
+```
+
+### Life Expectancy Histogram
+```{r}
+# Get the highest and lowest life expectancy values and labels
+max_le <- max(le_descriptives$`Statistic Value`)
+max_le_row <- bchc_final %>% filter(life_expectancy == max_le)
+
+min_le <- min(le_descriptives$`Statistic Value`)
+min_le_row <- bchc_final %>% filter(life_expectancy == min_le)
+
+max_label <- paste(
+  paste0("Max Life Expectancy: ", round(max_le, 2), " Years"),
+  paste("City:", max_le_row$city),
+  paste("Year:", max_le_row$year),
+  paste("Race:", max_le_row$race),
+  paste("Sex:", max_le_row$sex),
+  sep = "\n"
+)
+
+min_label <- paste(
+  paste0("Min Life Expectancy: ", round(min_le, 2), " Years"),
+  paste("City:", min_le_row$city),
+  paste("Year:", min_le_row$year),
+  paste("Race:", min_le_row$race),
+  paste("Sex:", min_le_row$sex),
+  sep = "\n"
+)
+
+# Plot histogram and add min/max annotations
+ggplot(bchc_final, aes(x = life_expectancy)) +
+  geom_histogram(fill = "#005AB5", color = "#c9c9c9", binwidth = 1) +
+  annotate("text", x = 90, y = 400, label = max_label, color = "#1c6b1b", size = 3.5, fontface = "bold") +
+  annotate("text", x = 65, y = 400, label = min_label, color = "#b30404", size = 3.5, fontface = "bold") +
+  labs(title = "Histogram of Life Expectancy",
+       x = "Life Expectancy (Years)",
+       y = "Count of Rows") +
+  hist_theme
+```
+
+## Potential Strong Predictors
+### Cardiovascular Disease Deaths
+```{r}
+# Pearson Correlation Test
+le_cv_corr <- cor.test(bchc_final$life_expectancy, bchc_final$cardiovascular_disease_deaths, method="pearson")
+le_cv_coef <- le_cv_corr$estimate
+le_cv_pval <- le_cv_corr$p.value
+
+# Scatterplot
+bchc_le_cv <- bchc_final %>%
+  filter(race != "All") %>%
+  mutate(race = if_else(race == "Asian", "Asian/PI", race))
+
+ggplot(bchc_le_cv, aes(x = life_expectancy, 
+                       y = cardiovascular_disease_deaths, 
+                       color = race)) +
+  geom_point(alpha = 0.7, size = 2.5) +
+  labs(
+    title = "Life Expectancy vs. Cardiovascular Disease Deaths",
+    subtitle = paste0("Pearson Correlation Coefficient = ", round(le_cv_coef, 2), " (P-Value: ", le_cv_pval, ")"),
+    x = "Life Expectancy (Years)",
+    y = "Cardiovascular Disease Deaths\n(Per 100,000, Age-Adjusted)",
+    color = "Race"
+  ) +
+  hist_theme +
+  theme(
+    legend.position = c(0.65, 0.98),
+    legend.justification = c("left", "top"),
+    legend.background = element_rect(fill = "white", color="black")
+  )
+```
+
+### Drug Overdose Deaths
+```{r,warning = FALSE}
+# Spearman Correlation Test
+le_do_corr <- cor.test(bchc_final$life_expectancy, bchc_final$drug_overdose_deaths, method="spearman")
+le_do_coef <- le_do_corr$estimate
+le_do_pval <- le_do_corr$p.value
+
+bchc_le_drug <- bchc_final %>%
+  filter(sex != "Both")
+
+ggplot(bchc_le_drug, aes(x = life_expectancy, 
+                         y = drug_overdose_deaths, 
+                         color = sex)) +
+  geom_point(alpha = 0.7, size = 2.5) +
+  scale_color_manual(values = c("Female" = "#b30404", "Male" = "#005AB5")) +
+  labs(
+    title = "Life Expectancy vs. Drug Overdose Deaths",
+    subtitle = paste0("Spearman Correlation Coefficient = ", round(le_do_coef, 2), " (P-Value: ", le_do_pval, ")"),
+    x = "Life Expectancy (Years)",
+    y = "Drug Overdose Deaths\n(Per 100,000, Age-Adjusted)",
+    color = "Sex"
+  ) +
+  hist_theme +
+  theme(
+    legend.position = c(0.85, 0.98),
+    legend.justification = c("left", "top"),
+    legend.background = element_rect(fill = "white", color="black")
+  )
+```
+
+# MODEL BUILDING AND EVALUATION
+In this section of code, I train LASSO, XGBoost, and ANN models using 10-fold single cross validation. I also perform 5-fold double cross validation. I then select the final model and evaluate performance based on MAE, R-squared, and analysis of high error points. Finally, I evaluate feature importance through importance plots, SHAP values, and partial dependence plots.
+
+
+## Model Training
+### Naive Model
+```{r}
+mean_le <- mean(bchc_final$life_expectancy)
+naive_mae <- round(mean(abs(bchc_final$life_expectancy - mean_le)), 3)
+print(paste0("Naive MAE: ", naive_mae))
+```
+
+### Baseline Model - LASSO
+#### Display Hyperparameter Values
+```{r}
+data.frame(Hyperparameter = c("$\\alpha$", "$\\lambda$"),
+           "Value(s)" = c("1", "100 values equally spaced from 0.0001 to 10"),
+           check.names = FALSE) %>%
+  kbl(caption = "LASSO Hyperparameters", booktabs = TRUE) %>%
+  kable_classic(full_width = FALSE, html_font = "Cambria") %>%
+  row_spec(0, bold = TRUE, extra_css = "border-top: 2px solid black;")
+```
+
+#### Fit models (10-fold CV)
+```{r, warning = FALSE, message = FALSE}
+set.seed(10) # Set seed for reproducibility
+train_method <- trainControl(method = "cv", number = 10)
+
+fit_lasso <- train(life_expectancy ~ .,
+                   data = bchc_final[, !(names(bchc_final) %in% c("city", "year", "race", "sex"))],
+                   method = "glmnet",
+                   tuneGrid = expand.grid(alpha = 1,
+                                          lambda = 10^seq(-4, 1, length=100)), # Tuning this hyperparameter
+                   trControl = train_method,
+                   preProcess = c("YeoJohnson", "center", "scale")) # Centered, scaled, and transformed
+```
+
+#### Display the results of the "best" LASSO model
+```{r}
+best_lasso <- fit_lasso$results[fit_lasso$results$MAE == min(fit_lasso$results$MAE), c(1:5)]
+best_lasso
+```
+
+### XGBoost
+#### Display Hyperparameter Values
+```{r}
+data.frame(Hyperparameter = c("Trees", "Max Tree Depth", "$\\eta$", "$\\Gamma$", "Fraction of Predictors Per Tree", "Minimum Child Weight", "Fraction of Rows Per Tree"),
+           "Value(s)" = c("75, 100, or 125", "3, 4, 5, 6, or 7", "0.3", "0", "0.8", "4", "1"),
+           check.names = FALSE) %>%
+  kbl(caption = "XGBoost Hyperparameters", booktabs = TRUE) %>%
+  kable_classic(full_width = FALSE, html_font = "Cambria") %>%
+  row_spec(0, bold = TRUE, extra_css = "border-top: 2px solid black;")
+```
+
+#### Fit models (10-fold CV)
+```{r, warning = FALSE, message = FALSE}
+set.seed(10) # Set seed for reproducibility
+train_method <- trainControl(method = "cv", number = 10)
+
+fit_xgb <- train(life_expectancy ~ ., 
+              data = bchc_final[, !(names(bchc_final) %in% c("city", "year", "race", "sex"))],
+              method = "xgbTree",
+              tuneGrid = expand.grid(nrounds = c(75,100,125), # Tuning this hyperparameter
+                                     max_depth = 3:7, # Tuning this hyperparameter
+                                     eta = 0.3,
+                                     gamma = 0,
+                                     colsample_bytree = 0.8,
+                                     min_child_weight = 4,
+                                     subsample = 1),
+              verbosity = 0,
+              trControl = train_method)
+```
+
+#### Display the results of the "best" XGBoost model
+```{r}
+best_xgb <- fit_xgb$results[fit_xgb$results$MAE == min(fit_xgb$results$MAE), c(2, 7:10)]
+best_xgb
+```
+
+### ANN
+#### Display Hyperparameter Values
+```{r}
+data.frame(Hyperparameter = c("Size", "Decay"),
+           "Value(s)" = c("3, 5, or 7", "0, 0.01, or 0.1"),
+           check.names = FALSE) %>%
+  kbl(caption = "ANN Hyperparameters", booktabs = TRUE) %>%
+  kable_classic(full_width = FALSE, html_font = "Cambria") %>%
+  row_spec(0, bold = TRUE, extra_css = "border-top: 2px solid black;")
+```
+
+#### Before fitting ANN model, choose the best features based on LASSO and XGBoost models
+```{r}
+# First, find top 20 most important variables in the XGBoost model
+xgb_importance <- varImp(fit_xgb)$importance
+xgb_importance$Feature <- rownames(xgb_importance)
+
+top_n <- 20
+top_xgb_features <- xgb_importance %>%
+  arrange(desc(Overall)) %>%
+  slice_head(n = top_n) %>%
+  pull(Feature)
+
+# Second, find features with non-zero coefficients in the LASSO model
+coef_lasso <- coef(fit_lasso$finalModel, s = fit_lasso$bestTune$lambda)
+top_lasso_features <- rownames(coef_lasso)[which(coef_lasso != 0)][-1]
+
+
+# Find the intersection of the best vars from the LASSO and XGBoost models
+selected_vars <- intersect(top_xgb_features, top_lasso_features)
+```
+
+#### Fit models (10-fold CV)
+```{r, warning = FALSE, message = FALSE}
+set.seed(10) # Set seed for reproducibility
+train_method <- trainControl(method = "cv", number = 10)
+
+fit_ann <- train(life_expectancy ~ ., 
+              data = bchc_final[, c("life_expectancy", selected_vars)],
+              method = "nnet",
+              tuneGrid = expand.grid(size = c(3, 5, 7), # Tuning this hyperparameter
+                                     decay = c(0, 0.01, 0.1)), # Tuning this hyperparameter
+              linout = TRUE,
+              trace = FALSE,
+              maxit = 200, # Control number of iterations
+              trControl = train_method,
+              preProcess = c("YeoJohnson", "range")) # Transformation + min-max scaling
+```
+
+#### Display the results of the "best" ANN model
+```{r}
+best_ann <- fit_ann$results[fit_ann$results$MAE == min(fit_ann$results$MAE),]
+best_ann
+```
+
+### 5-Fold Double CV of entire model selection process
+```{r, warning = FALSE, message = FALSE}
+set.seed(10) # Set seed for reproducibility
+
+# Setup
+n <- nrow(bchc_final)
+pred_los_outer <- rep(NA, n)
+
+nfolds_outer <- 5
+groups <- rep(1:nfolds_outer, length = n)
+cvgroups <- sample(groups, n)
+
+train_method <- trainControl(method = "cv", number = 10)
+
+# Initiate outer loop
+for (j in 1:nfolds_outer) {
+  in_train <- (cvgroups != j)
+  in_valid <- (cvgroups == j) 
+  traindata.out <- bchc_final[in_train,]
+  validdata.out <- bchc_final[in_valid,]
+  
+  # LASSO single CV
+  lasso <- train(life_expectancy ~ .,
+                   data = traindata.out[, !(names(traindata.out) %in% c("city", "year", "race", "sex"))],
+                   method = "glmnet",
+                   tuneGrid = expand.grid(alpha = 1,
+                                          lambda = 10^seq(-4, 1, length=100)), # Tuning this hyperparameter
+                   trControl = train_method,
+                   preProcess = c("YeoJohnson", "center", "scale")) # Centered, scaled, and transformed
+  
+  # XGBoost single CV
+  xgb <- train(life_expectancy ~ ., 
+              data = traindata.out[, !(names(traindata.out) %in% c("city", "year", "race", "sex"))],
+              method = "xgbTree",
+              tuneGrid = expand.grid(nrounds = c(75,100,125), # Tuning this hyperparameter
+                                     max_depth = 3:7, # Tuning this hyperparameter
+                                     eta = 0.3,
+                                     gamma = 0,
+                                     colsample_bytree = 0.8,
+                                     min_child_weight = 4,
+                                     subsample = 1),
+              verbosity = 0,
+              trControl = train_method)
+  
+  # ANN single CV
+  ann <- train(life_expectancy ~ ., 
+              data = traindata.out[, c("life_expectancy", selected_vars)],
+              method = "nnet",
+              tuneGrid = expand.grid(size = c(3, 5, 7), # Tuning this hyperparameter
+                                     decay = c(0, 0.01, 0.1)), # Tuning this hyperparameter
+              linout = TRUE,
+              trace = FALSE,
+              maxit = 200, # Control number of iterations
+              trControl = train_method,
+              preProcess = c("YeoJohnson", "range")) # Transformation + min-max scaling
+  
+  
+  # Find lowest MAE
+  all_MAE_CV <- c(min(lasso$results$MAE),
+                  min(xgb$results$MAE),
+                  min(ann$results$MAE))
+  
+  all_train_output <- list(lasso, xgb, ann)
+  
+  allbest <- which(all_MAE_CV == min(all_MAE_CV))
+  whichbest <- ifelse(length(allbest) == 1, allbest, sample(allbest,1))
+  bestmodel_train_output <- all_train_output[[whichbest]]
+
+  pred_los <- bestmodel_train_output %>% predict(validdata.out)
+  pred_los_outer[in_valid] <- pred_los
+}
+
+# Display performance metrics
+mae <- round(mean(abs(pred_los_outer - bchc_final$life_expectancy)), 3)
+r2 <- round(1 - sum((bchc_final$life_expectancy - pred_los_outer)^2) / sum((bchc_final$life_expectancy - mean(bchc_final$life_expectancy))^2), 3)
+sprintf("MAE: %s", mae)
+sprintf("R-squared: %s", r2)
+```
+
+### Display performance metrics
+```{r, purl = FALSE}
+lasso_mae <- round(best_lasso$MAE, 3)
+lasso_r2 <- round(best_lasso$Rsquared, 3)
+xgb_mae <- round(best_xgb$MAE, 3)
+xgb_r2 <- round(best_xgb$Rsquared,3)
+ann_mae <- round(best_ann$MAE, 3)
+ann_r2 <- round(best_ann$Rsquared, 3)
+lasso_hyperparams = paste0("$\\lambda$", " = ", round(best_lasso$lambda, 5))
+xgb_hyperparams = paste0("Trees = ", best_xgb$nrounds, "; Max Tree Depth = ", best_xgb$max_depth)
+ann_hyperparams = paste0("Size = ", best_ann$size, "; Decay = ", best_ann$decay)
+
+data.frame(Model = c("LASSO", "XGBoost", "ANN"),
+           MAE = c(lasso_mae, xgb_mae, ann_mae),
+           `R²` = c(lasso_r2, xgb_r2, ann_r2),
+           "Tuned Hyperparameters" = c(lasso_hyperparams, xgb_hyperparams, ann_hyperparams),
+           check.names = FALSE) %>%
+  kbl(caption = "Model Performance Metrics", booktabs = TRUE) %>%
+  kable_classic(full_width = FALSE, html_font = "Cambria") %>%
+  row_spec(0, bold = TRUE, extra_css = "border-top: 2px solid black;")
+```
+
+### Select final model and add predictions to dataframe
+```{r, warning = FALSE, message = FALSE}
+best_model <- fit_xgb$finalModel
+X <- as.matrix(bchc_final[, names(fit_xgb$trainingData)[-1]])
+bchc_final$pred_life_expectancy <- predict(best_model, X)
+bchc_final$residual <- bchc_final$life_expectancy - bchc_final$pred_life_expectancy
+```
+
+## Model Evaluation
+### Histogram of Residuals
+```{r}
+ggplot(bchc_final, aes(x = residual)) +
+  geom_histogram(fill = "#005AB5", color = "#c9c9c9", binwidth = 0.25) +
+  geom_vline(xintercept=-2.5, linetype = "dashed", color="#b30404", size=1) +
+  geom_vline(xintercept=2.5, linetype = "dashed", color="#b30404", size=1) +
+  labs(title = "Histogram of Model Residuals",
+       x = "Residual (Observed - Predicted Life Expectancy)",
+       y = "Count of Rows") +
+  hist_theme
+```
+
+### Scatterplot of Actual Life Expectancy vs. Residuals
+```{r}
+ggplot(bchc_final, aes(x = life_expectancy, 
+                       y = residual,
+                       color = abs(residual) > 2.5)) +
+  geom_point(alpha = 0.7, size = 2.5) +
+  scale_color_manual(
+    values = c("FALSE" = "#005AB5", "TRUE" = "#b30404"),
+    labels = c("<= 2.5", "> 2.5"),
+    name = "|Residual|"
+  ) +
+  labs(
+    title = "Life Expectancy vs. Residuals",
+    x = "Actual Life Expectancy (Years)",
+    y = "Residuals\n(Observed - Predicted Life Expectancy)"
+  ) +
+  hist_theme +
+  theme(
+    legend.position = c(0.8, 0.35),
+    legend.justification = c("left", "top"),
+    legend.background = element_rect(fill = "white", color="black")
+  )
+```
+
+### Frequency of High Error Data Points by Race/Sex
+```{r}
+high_error <- bchc_final[abs(bchc_final$residual) > 2.5, ]
+
+race_sex_freq <- high_error %>%
+  count(race, sex) %>%
+  pivot_wider(names_from = sex, values_from = n, values_fill = 0)
+
+race_sex_freq <- race_sex_freq %>%
+  rowwise() %>%
+  mutate(Total = sum(c_across(where(is.numeric)))) %>%
+  rename(Race = race) %>%
+  arrange(desc(Total))
+
+total_row <- data.frame(Race = "Total",
+                        Both = sum(race_sex_freq$Both),
+                        Female = sum(race_sex_freq$Female),
+                        Male = sum(race_sex_freq$Male),
+                        Total = sum(race_sex_freq$Total))
+
+race_sex_freq <- bind_rows(race_sex_freq, total_row)
+
+race_sex_freq %>%
+  kbl(caption = "Race and Sex Frequency for High Errors", booktabs = TRUE) %>%
+  add_header_above(c(" " = 1, "Sex" = 3, " " = 1)) %>%
+  kable_classic(full_width = FALSE, html_font = "Cambria") %>%
+  row_spec(0, bold = TRUE, extra_css = "border-top: 2px solid black;") %>%
+  row_spec(nrow(race_sex_freq), bold = TRUE, extra_css = "border-top: 2px solid black;")
+```
+
+## Boxplots of Asian/PI and Hispanic Populations of Both Sexes Actual and Predicted Life Expectancy
+```{r}
+# Filter Data
+boxplot_data <- bchc_final %>% filter(race %in% c("Asian/PI", "Hispanic"), sex == "Both")
+boxplot_outliers_actual <-count_outliers(boxplot_data[["life_expectancy"]])
+boxplot_outliers_pred <-count_outliers(boxplot_data[["pred_life_expectancy"]])
+
+# Actual Life Expectancy Boxplot
+ggplot(boxplot_data, aes(x = reorder(race, life_expectancy, FUN = median), y = life_expectancy,  fill = race)) +
+  geom_boxplot(
+    outlier.colour = "#b30404",      
+    outlier.shape = 8,
+    outlier.size = 2
+  ) +
+  annotate("text", x = 1.65, y = 70, 
+           label = paste("Outliers:", boxplot_outliers_actual),
+           hjust = 1.1, vjust = -0.5, color = "#b30404", size = 4) +
+  scale_fill_manual(values = c("Hispanic" = "#2ecc71", "Asian/PI" = "#3498db")) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(title = "Boxplot of Life Expectancy by Race",
+       subtitle = "Asian/PI and Hispanic Populations of Both Sexes",
+       x = "Race",
+       y = "Life Expectancy") +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", size = 18, color = "#2c3e50", hjust = 0.5),
+    plot.subtitle = element_text(face = "italic", size = 14, color = "#34495e", hjust = 0.5),
+    axis.title.y = element_text(size = 14, face = "bold", color = "#2c3e50"),
+    axis.text.y = element_text(size = 12, color = "#2c3e50"),
+    axis.title.x = element_text(size = 14, face = "bold", color = "#2c3e50"),
+    axis.text.x = element_text(size = 12, color = "#2c3e50"),
+    legend.position = "none"
+  )
+
+# Predicted Life Expectancy Boxplot
+ggplot(boxplot_data, aes(x = reorder(race, pred_life_expectancy, FUN = median), y = pred_life_expectancy,  fill = race)) +
+  geom_boxplot(
+    outlier.colour = "#b30404",      
+    outlier.shape = 8,
+    outlier.size = 2
+  ) +
+  annotate("text", x = 1.65, y = 70, 
+           label = paste("Outliers:", boxplot_outliers_pred),
+           hjust = 1.1, vjust = -0.5, color = "#b30404", size = 4) +
+  scale_fill_manual(values = c("Hispanic" = "#2ecc71", "Asian/PI" = "#3498db")) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(title = "Boxplot of Predicted Life Expectancy by Race",
+       subtitle = "Asian/PI and Hispanic Populations of Both Sexes",
+       x = "Race",
+       y = "Predicted Life Expectancy") +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", size = 18, color = "#2c3e50", hjust = 0.5),
+    plot.subtitle = element_text(face = "italic", size = 14, color = "#34495e", hjust = 0.5),
+    axis.title.y = element_text(size = 14, face = "bold", color = "#2c3e50"),
+    axis.text.y = element_text(size = 12, color = "#2c3e50"),
+    axis.title.x = element_text(size = 14, face = "bold", color = "#2c3e50"),
+    axis.text.x = element_text(size = 12, color = "#2c3e50"),
+    legend.position = "none"
+  )
+```
+
+### SHAP
+#### Calculate SHAP Values
+```{r}
+shap_values <- shap.values(xgb_model = best_model, X_train = X)
+shap_long <- shap.prep(xgb_model = best_model, X_train = X)
+```
+
+#### Display largest over and under-predictions
+```{r}
+highest_error <- high_error %>%
+  arrange(desc(residual)) %>%
+  mutate(life_expectancy = round(life_expectancy, 3),
+         pred_life_expectancy = round(pred_life_expectancy, 3),
+         residual = round(residual, 3)) %>%
+  head(1)
+
+lowest_error <- high_error %>%
+  arrange(residual) %>%
+  mutate(life_expectancy = round(life_expectancy, 3),
+         pred_life_expectancy = round(pred_life_expectancy, 3),
+         residual = round(residual, 3)) %>%
+  head(1)
+
+bind_rows(highest_error, lowest_error) %>%
+  dplyr::select(c(city, year, race, sex, life_expectancy, pred_life_expectancy, residual)) %>%
+  rename("City" = city,
+         "Year" = year,
+         "Race" = race,
+         "Sex" = sex,
+         "Actual Life Expectancy" = life_expectancy,
+         "Predicted Life Expectancy" = pred_life_expectancy,
+         "Residual" = residual) %>%
+  kbl(caption = "Largest Over-Prediction and Under-Prediction", booktabs = TRUE) %>%
+  kable_classic(full_width = FALSE, html_font = "Cambria") %>%
+  row_spec(0, bold = TRUE, extra_css = "border-top: 2px solid black;")
+```
+
+#### SHAP plots for largest over and under-predictions
+```{r}
+# Find largest residual points and corresponding SHAP values
+highest_error_preds <- highest_error %>% dplyr::select(-c(city, year, race, sex, life_expectancy, pred_life_expectancy, residual)) %>% as.matrix()
+lowest_error_preds <- lowest_error %>% dplyr::select(-c(city, year, race, sex, life_expectancy, pred_life_expectancy, residual)) %>% as.matrix()
+highest_idx <- which(apply(X, 1, function(y) all(y == highest_error_preds[1, ])))
+lowest_idx <- which(apply(X, 1, function(y) all(y == lowest_error_preds[1, ])))
+shap_highest <- as.numeric(shap_values$shap_score[highest_idx, ])
+shap_lowest <- as.numeric(shap_values$shap_score[lowest_idx, ])
+
+highest_df <- data.frame(
+  Feature = colnames(X),
+  SHAP = shap_highest
+)
+
+lowest_df <- data.frame(
+  Feature = colnames(X),
+  SHAP = shap_lowest
+)
+
+# Plot SHAP values
+ggplot(highest_df, aes(x = reorder(Feature, SHAP), y = SHAP, fill = SHAP > 0)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  labs(title = "SHAP for Largest Under-Prediction",
+       subtitle = "Hispanic Males Milwaukee, WI in 2019",
+       y = "SHAP Value",
+       x = "") +
+  hist_theme +
+  theme(legend.position = "none")
+
+ggplot(lowest_df, aes(x = reorder(Feature, SHAP), y = SHAP, fill = SHAP > 0)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  labs(title = "SHAP for Largest Over-Prediction",
+       subtitle = "Hispanics of Both Sexes Portland, OR in 2020",
+       y = "SHAP Value",
+       x = "") +
+  hist_theme +
+  theme(legend.position = "none")
+```
+
+## Feature Importance
+### Feature Importance Plot
+```{r, warning = FALSE, message = FALSE}
+imp <- xgb.importance(feature_names = best_model$feature_names,
+               model = best_model)
+
+xgb.ggplot.importance(imp, top_n = 15) +
+  ggtitle("Top 15 Most Important Features in Final Model") +
+  hist_theme
+```
+
+### Overall SHAP Plot
+```{r}
+shap.plot.summary(shap_long)
+```
+
+### Partial Dependency Plots
+```{r}
+# Select example predictors for PDPs
+pdp_vars <- c(
+  "injury_deaths",
+  "cardiovascular_disease_deaths",
+  "all_cancer_deaths",
+  "diabetes_deaths",
+  "per.capita_household_income",
+  "uninsured_all_ages"
+)
+pdp_plots <- list()
+
+# Generate a plot for each predictor
+for (v in pdp_vars) {
+  
+  pdp_df <- partial(
+    object = best_model,
+    pred.var = v,
+    train = as.data.frame(X),
+  )
+  
+  p <- ggplot(pdp_df, aes_string(x = v, y = "yhat")) +
+    geom_line(color = "#2E86AB", size = 1.2) +
+    labs(
+      title = v,
+      x = "Predictor Value",
+      y = "Predicted Life Expectancy"
+    ) +
+    theme(
+      plot.title = element_text(face = "bold", size = 9, color = "#2c3e50"),
+      axis.title.x = element_blank(),
+      axis.title.y = element_blank(),
+    )
+  
+  pdp_plots[[v]] <- p
+}
+
+# Arrange plots in grid
+grid.arrange(pdp_plots[[1]], pdp_plots[[2]], pdp_plots[[3]], pdp_plots[[4]], pdp_plots[[5]], pdp_plots[[6]], nrow=2, ncol=3,
+             bottom = textGrob("Predictor Value", gp = gpar(fontsize = 14)),
+             left = textGrob("Average Predicted Life Expectancy", rot = 90, gp = gpar(fontsize = 14)))
+```
+
+# RESULTS, INSIGHTS, AND RECOMMENDATIONS
+In this section of code, I determine three predictors having a large negative impact on life expectancy for the most vulnerable demographic groups in Long Beach, CA. I then inspect some overall trends and statistics related to these factors to support the narrative in my final paper.
+
+## Long Beach, CA - 2023
+### Find the five lowest life expectancy demographic groups
+```{r}
+lb2023_lowest_df <- bchc_final %>%
+  filter(city == "Long Beach, CA",
+         year == "2023",
+         race != "All",
+         sex != "Both") %>%
+  arrange(pred_life_expectancy) %>%
+  head(5)
+
+lb2023_lowest_df %>%
+  dplyr::select(c(race, sex, pred_life_expectancy)) %>%
+  rename(Race = race,
+         Sex = sex,
+         `Predicted Life Expectancy` = pred_life_expectancy) %>%
+  kbl(caption = "Five Demographic Groups with Lowest Predicted Life Expectancy; Long Beach, CA; 2023", booktabs = TRUE) %>%
+  kable_classic(full_width = FALSE, html_font = "Cambria") %>%
+  row_spec(0, bold = TRUE, extra_css = "border-top: 2px solid black;")
+```
+
+### Inspect SHAP values for Lowest Predicted Life Expectancy Populations in Long Beach, CA in 2023
+```{r}
+# Find features with negative SHAP values for our case study
+lb2023_lowest <- lb2023_lowest_df %>%
+  dplyr::select(-c(city, year, race, sex, life_expectancy, pred_life_expectancy, residual)) %>%
+  as.matrix()
+
+lb2023_lowest_idx <- which(apply(X, 1, function(y) all(y == lb2023_lowest[1, ])))
+shap_lb2023_lowest <- as.numeric(shap_values$shap_score[lb2023_lowest_idx, ])
+
+lb2023_lowest_shap <- data.frame(
+  Feature = colnames(X),
+  SHAP = shap_lb2023_lowest
+) %>%
+  filter(SHAP < 0)
+
+# Plot SHAP values
+ggplot(lb2023_lowest_shap, aes(x = reorder(Feature, SHAP), y = SHAP, fill = SHAP > 0)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  labs(title = "Negative SHAP Values for Long Beach in 2023",
+       subtitle = "Limited to the Five Demographic Groups\nwith the Lowest Predicted Life Expectancy",
+       y = "SHAP Value",
+       x = "") +
+  hist_theme +
+  theme(legend.position = "none")
+```
+
+### Inspect Cardiovascular Disease Deaths by City in 2023
+```{r}
+bchc_final %>%
+  filter(year == "2023",
+         race == "All",
+         sex == "Both") %>%
+  dplyr::select(c(city, cardiovascular_disease_deaths)) %>%
+  arrange(desc(cardiovascular_disease_deaths))
+```
+
+### Trend Motor Vehicle Deaths Over Time
+```{r}
+lb_motor <- bchc_final %>%
+  filter(city == "Long Beach, CA",
+         race == "All",
+         sex == "Both") %>%
+  dplyr::select(year, motor_vehicle_deaths) %>%
+  mutate(year = as.numeric(as.character(year)))
+
+ggplot(lb_motor, aes(x = year, y = motor_vehicle_deaths)) +
+  geom_line(size = 1.2) +
+  geom_vline(xintercept=2020, linetype = "dashed", color="#b30404", size=1) +
+  scale_x_continuous(breaks = unique(lb_motor$year)) +
+  annotate(
+    "text",
+    x = 2020.4,
+    y = 8.6,
+    label = "Safe Streets Long Beach Action Plan",
+    color = "#b30404",
+    angle = 90,
+    hjust = 0.5,
+    vjust = 0
+  ) +
+  labs(
+    title = "Motor Vehicle Deaths Per Year",
+    subtitle = "All Demographic Groups; Long Beach, CA",
+    x = "Year",
+    y = "Motor Vehicle Deaths\n(Per 100,000, Age-Adjusted)"
+  ) +
+  hist_theme +
+  theme(panel.grid.minor.x = element_blank())
+```
+
+### Inspect Diabetes Deaths by City in 2023
+```{r}
+bchc_final %>%
+  filter(year == "2023",
+         race == "All",
+         sex == "Both") %>%
+  dplyr::select(c(city, diabetes_deaths)) %>%
+  arrange(desc(diabetes_deaths))
+```
+
+### Inspect Diabetes Death Rates between Demographic Groups
+```{r}
+lb_diabetes <- bchc_final %>%
+  filter(
+    city == "Long Beach, CA",
+    year == "2023",
+    race %in% c("Black", "White"),
+    sex %in% c("Female", "Male")
+  ) %>%
+  dplyr::select(race, sex, diabetes_deaths)
+
+ggplot(lb_diabetes, aes(x = race, y = diabetes_deaths, fill = race)) +
+  geom_col() +
+  facet_wrap(~ sex, ncol = 2) +
+  labs(
+    title = "2023 Diabetes Deaths in Long Beach, CA",
+    subtitle = "By Race and Sex",
+    x = "Race",
+    y = "Diabetes Deaths\n(Per 100,000, Age-Adjusted)"
+  ) +
+  hist_theme +
+  theme(legend.position = "none")
+```
